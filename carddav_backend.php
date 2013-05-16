@@ -414,10 +414,12 @@ class carddav_backend extends rcube_addressbook
 		$this->existing_card_cache[$contact['uri']] = $contact;
 	}
 
-	// determine existing local group URIs and ETAGs
-	$groups = self::get_dbrecord($this->id,'id,uri,etag','groups',false,'abook_id');
-	foreach($groups as $group) {
-		$this->existing_grpcard_cache[$group['uri']] = $group;
+	if(!$this->config['use_categories']) {
+		// determine existing local group URIs and ETAGs
+		$groups = self::get_dbrecord($this->id,'id,uri,etag','groups',false,'abook_id');
+		foreach($groups as $group) {
+			$this->existing_grpcard_cache[$group['uri']] = $group;
+		}
 	}
 
 	// used to record which users need to be added to which groups
@@ -722,30 +724,52 @@ EOF
 			$vcf = $vcfobj->serialize();
 		$save_data = $save_data['save_data'];
 
-		if($save_data['kind'] === 'group') {
-			self::$helper->debug('Processing Group ' . $save_data['name']);
-			// delete current group members (will be reinserted if needed below)
-			if($dbid) self::delete_dbrecord($dbid,'group_user','group_id');
+		if($save_data['kind'] === 'group' ) {
+			if(!$this->config['use_categories']) {
+				self::$helper->debug('Processing Group ' . $save_data['name']);
+				// delete current group members (will be reinserted if needed below)
+				if($dbid) self::delete_dbrecord($dbid,'group_user','group_id');
 
-			// store group card
-			if(!($dbid = $this->dbstore_group("$etag","$href","$vcf",$save_data,$dbid)))
-				return -1;
+				// store group card
+				if(!($dbid = $this->dbstore_group("$etag","$href","$vcf",$save_data,$dbid)))
+					return -1;
 
-			// record group members for deferred store
-			$this->users_to_add[$dbid] = array();
-			$members = $vcfobj->{'X-ADDRESSBOOKSERVER-MEMBER'};
-			self::$helper->debug("Group $dbid has " . count($members) . " members");
-			foreach($members as $mbr) {
-				$mbr = preg_split('/:/', $mbr);
-				if(!$mbr) continue;
-				if(count($mbr)!=3 || $mbr[0] !== 'urn' || $mbr[1] !== 'uuid') {
-					self::$helper->warn("don't know how to interpret group membership: " . implode(':', $mbr));
-					continue;
+				// record group members for deferred store
+				$this->users_to_add[$dbid] = array();
+				$members = $vcfobj->getProperties('X-ADDRESSBOOKSERVER-MEMBER');
+				self::$helper->debug("Group $dbid has " . count($members) . " members");
+				foreach($members as $mbr) {
+                    $mbr = preg_split('/:/', $mbr);
+					if(!$mbr) continue;
+					if(count($mbr)!=3 || $mbr[0] !== 'urn' || $mbr[1] !== 'uuid') {
+						self::$helper->warn("don't know how to interpret group membership: " . implode(':', $mbr));
+						continue;
+					}
+					$this->users_to_add[$dbid][] = $dbh->quote($mbr[2]);
 				}
-				$this->users_to_add[$dbid][] = $dbh->quote($mbr[2]);
 			}
-
 		} else { // individual/other
+			if($this->config['use_categories']) {
+				// delete current member from groups (will be reinserted if needed below)
+				self::delete_dbrecord($dbid,'group_user','contact_id');
+				foreach ($vcfobj->getCategories() as $category) {
+					if($category !== "All" && $category !== "Unfiled") {
+						$record = self::get_dbrecord($category, 'id', 'groups', true, 'name');
+						if(!$record) {
+							// store group card
+							if(!($database = $this->dbstore_group("dummy","$database","dummy",array("name" => "$category", "cuid" => "$database"))))
+								return -1;
+						} else {
+							$database = $record['id'];
+						}
+						if(!isset($this->users_to_add[$database])) {
+							$this->users_to_add[$database] = array();
+						}
+						$uid = $save_data['cuid'];
+						$this->users_to_add[$database][] = $dbh->quote($uid);
+					}
+				}
+			}
       if (trim($save_data['name']) == '') { // roundcube display fix for contacts that don't have first/last names
         if ($save_data['nickname'] !== NULL && trim($save_data['nickname'] !== '')) {
           $save_data['name'] = $save_data['nickname'];
@@ -1106,7 +1130,6 @@ EOF
 		self::$helper->warn("Request for VCF '$uid' which doesn't exist on the server.");
 		return false;
 	}
-
 	return array(
 		'vcf'  => $reply["body"],
 		'etag' => $reply['headers']['etag'],
@@ -1707,6 +1730,51 @@ EOF
 	return $deleted;
 	}}}
 
+	private function update_contact_categories($id,$vcf) {
+		$groups = $this->get_record_groups($id);
+		
+		if($vcf->getProperty('CATEGORY')) {
+			$cat_name = "CATEGORY";
+		} else {
+			$cat_name  = "CATEGORIES";
+		}
+		$vcf->deleteProperty($cat_name);
+		$i = 0;
+		foreach($groups as $group_id => $grpname) {
+			$vcf->setProperty($cat_name, $grpname, 0, $i,'',',');
+			$i++;
+		}
+	}
+	
+	private function update_contacts($ids) {
+		foreach ($ids as $id) {
+			$contact = self::get_dbrecord($id,'id,cuid,uri,etag,vcard,showas');
+			if(!$contact) return false;
+			$vcf = new VCard;
+			if(!$vcf->parse($contact['vcard'])){
+				self::$helper->warn("Update: Couldn't parse local vcard: ".$contact['vcard']);
+				return false;
+			}
+			
+			$this->update_contact_categories($id,$vcf);
+			
+			$vcfstr = $vcf->toString();
+			
+			$save_data = $this->create_save_data_from_vcard("$vcfstr")['save_data'];
+			// complete save_data
+			$save_data['showas'] = $contact['showas'];
+			$this->preprocess_rc_savedata($save_data);
+			
+			if(!($etag=$this->put_record_to_carddav($contact['uri'], $vcfstr, $contact['etag']))) {
+				self::$helper->warn("Updating card on server failed");
+				return false;
+			}
+			$id = $this->dbstore_contact($etag,$contact['uri'],$vcfstr,$save_data,$id);
+
+		}
+		return true;
+	}
+	
 	/**
 	 * Add the given contact records the a certain group
 	 *
@@ -1718,33 +1786,33 @@ EOF
 	{{{
 	if (!is_array($ids))
 		$ids = explode(',', $ids);
+	if(!$this->config['use_categories']) {
+		// get current DB data
+		$group = self::get_dbrecord($group_id,'uri,etag,vcard,name,cuid','groups');
+		if(!$group)	return false;
 
-	// get current DB data
-	$group = self::get_dbrecord($group_id,'uri,etag,vcard,name,cuid','groups');
-	if(!$group)	return false;
+		// create vcard from current DB data to be updated with the new data
+        try {
+            $vcf = VObject\Reader::read($group['vcard'], VObject\Reader::OPTION_FORGIVING);
+        } catch (Exception $e) {
+            self::$helper->warn("Update: Couldn't parse local group vcard: ".$group['vcard']);
+            return false;
+        }
 
-	// create vcard from current DB data to be updated with the new data
-	try {
-		$vcf = VObject\Reader::read($group['vcard'], VObject\Reader::OPTION_FORGIVING);
-	} catch (Exception $e) {
-		self::$helper->warn("Update: Couldn't parse local group vcard: ".$group['vcard']);
-		return false;
+        foreach ($ids as $cid) {
+            $contact = self::get_dbrecord($cid,'cuid');
+            if(!$contact) return false;
+
+            $vcf->{'X-ADDRESSBOOKSERVER-MEMBER'} = "urn:uuid:" . $contact['cuid'];
+        }
+
+	    $vcfstr = $vcf->serialize();
+		if(!($etag = $this->put_record_to_carddav($group['uri'], $vcfstr, $group['etag'])))
+			return false;
+
+		if(!$this->dbstore_group($etag,$group['uri'],$vcfstr,$group,$group_id))
+			return false;
 	}
-
-	foreach ($ids as $cid) {
-		$contact = self::get_dbrecord($cid,'cuid');
-		if(!$contact) return false;
-
-		$vcf->{'X-ADDRESSBOOKSERVER-MEMBER'} = "urn:uuid:" . $contact['cuid'];
-	}
-
-	$vcfstr = $vcf->serialize();
-	if(!($etag = $this->put_record_to_carddav($group['uri'], $vcfstr, $group['etag'])))
-		return false;
-
-	if(!$this->dbstore_group($etag,$group['uri'],$vcfstr,$group,$group_id))
-		return false;
-
 	$dbh = rcmail::get_instance()->db;
 	foreach ($ids as $cid) {
 		$dbh->query('INSERT INTO ' .
@@ -1752,8 +1820,12 @@ EOF
 			' (group_id,contact_id) VALUES (?,?)',
 				$group_id, $cid);
 	}
-
-	return true;
+	if($this->config['use_categories']) {
+		if(!$this->update_contacts($ids))
+			return false;
+		$added = count($ids);
+	}
+	return $added;
 	}}}
 
 	/**
@@ -1768,41 +1840,46 @@ EOF
 	if (!is_array($ids))
 		$ids = explode(',', $ids);
 
-	// get current DB data
-	$group = self::get_dbrecord($group_id,'name,cuid,uri,etag,vcard','groups');
-	if(!$group)	return false;
+	if(!$this->config['use_categories']) {
+		// get current DB data
+		$group = self::get_dbrecord($group_id,'name,cuid,uri,etag,vcard','groups');
+		if(!$group)	return false;
 
-	// create vcard from current DB data to be updated with the new data
-	try {
-		$vcf = VObject\Reader::read($group['vcard'], VObject\Reader::OPTION_FORGIVING);
-	} catch (Exception $e) {
-		self::$helper->warn("Update: Couldn't parse local group vcard: ".$group['vcard']);
-		return false;
+        // create vcard from current DB data to be updated with the new data
+        try {
+            $vcf = VObject\Reader::read($group['vcard'], VObject\Reader::OPTION_FORGIVING);
+        } catch (Exception $e) {
+            self::$helper->warn("Update: Couldn't parse local group vcard: ".$group['vcard']);
+            return false;
+        }
+
+        $deleted = 0;
+        foreach ($ids as $cid) {
+            $contact = self::get_dbrecord($cid,'cuid');
+            if(!$contact) return false;
+
+            $search_for = 'urn:uuid:' . $contact['cuid'];
+            foreach ($vcf->{'X-ADDRESSBOOKSERVER-MEMBER'} as $member) {
+                if ($member == $search_for) {
+                    $vcf->remove($member);
+                    break;
+                }
+            }
+            $deleted++;
+        }
+
+        $vcfstr = $vcf->serialize();
+        if(!($etag = $this->put_record_to_carddav($group['uri'], $vcfstr, $group['etag'])))
+            return false;
+
+		if(!$this->dbstore_group($etag,$group['uri'],$vcfstr,$group,$group_id))
+			return false;
 	}
-
-	$deleted = 0;
-	foreach ($ids as $cid) {
-		$contact = self::get_dbrecord($cid,'cuid');
-		if(!$contact) return false;
-
-		$search_for = 'urn:uuid:' . $contact['cuid'];
-		foreach ($vcf->{'X-ADDRESSBOOKSERVER-MEMBER'} as $member) {
-			if ($member == $search_for) {
-				$vcf->remove($member);
-				break;
-			}
-		}
-		$deleted++;
-	}
-
-	$vcfstr = $vcf->serialize();
-	if(!($etag = $this->put_record_to_carddav($group['uri'], $vcfstr, $group['etag'])))
-		return false;
-
-	if(!$this->dbstore_group($etag,$group['uri'],$vcfstr,$group,$group_id))
-		return false;
-
 	self::delete_dbrecord($ids,'group_user','contact_id', array('group_id' => $group_id));
+	if($this->config['use_categories']) {
+		$this->update_contacts($ids);
+		$deleted=count($ids);
+	}
 	return $deleted;
 	}}}
 
@@ -1826,7 +1903,6 @@ EOF
 	while ($row = $dbh->fetch_assoc($sql_result)) {
 		$res[$row['id']] = $row['name'];
 	}
-
 	return $res;
 	}}}
 
@@ -1872,7 +1948,7 @@ EOF
 		$row['ID'] = $row['id'];
 		$groups[] = $row;
 	}
-
+	
 	return $groups;
 	}}}
 
@@ -1892,19 +1968,21 @@ EOF
 		'kind' => 'group',
 		'cuid' => $cuid,
 	);
-
 	$vcf = $this->create_vcard_from_save_data($save_data);
 	if (!$vcf) return false;
 	$vcfstr = $vcf->serialize();
-
-	if (!($etag = $this->put_record_to_carddav($uri, $vcfstr)))
-		return false;
-
-	$url = carddav_common::concaturl($this->config['url'], $uri);
-	$url = preg_replace(';https?://[^/]+;', '', $url);
+	if(!$this->config['use_categories']) {
+		if (!($etag = $this->put_record_to_carddav($uri, $vcfstr)))
+			return false;
+			
+		$url = carddav_common::concaturl($this->config['url'], $uri);
+		$url = preg_replace(';https?://[^/]+;', '', $url);
+	} else {
+		$etag="dummy";
+		$url="dummy";
+	}
 	if(!($dbid = $this->dbstore_group($etag,$url,$vcfstr,$save_data)))
 		return false;
-
 	return array('id'=>$dbid, 'name'=>$name);
 	}}}
 
@@ -1916,16 +1994,32 @@ EOF
 	 */
 	public function delete_group($group_id)
 	{{{
+	$ids = null;
 	// get current DB data
 	$group = self::get_dbrecord($group_id,'uri','groups');
 	if(!$group)	return false;
-
-	if($this->delete_record_from_carddav($group['uri'])) {
+	
+	if($this->config['use_categories']) {
+		$contacts = self::get_dbrecord($group_id, 'contact_id as id', 'group_user', false, 'group_id');
+		$ids = array();
+		foreach($contacts as $contact) {
+			$ids[]=$contact['id'];
+		}
+	}
+	if(!$this->config['use_categories']) {
+		if($this->delete_record_from_carddav($group['uri'])) {
+			self::delete_dbrecord($group_id, 'groups');
+			self::delete_dbrecord($group_id, 'group_user', 'group_id');
+			return true;
+		}
+	} else {
 		self::delete_dbrecord($group_id, 'groups');
 		self::delete_dbrecord($group_id, 'group_user', 'group_id');
+	}
+	if($this->config['use_categories']) {
+		$this->update_contacts($ids);
 		return true;
 	}
-
 	return false;
 	}}}
 
@@ -1944,24 +2038,37 @@ EOF
 	if(!$group)	return false;
 	$group['name'] = $newname;
 
-	// create vcard from current DB data to be updated with the new data
-	try {
-		$vcf = VObject\Reader::read($group['vcard'], VObject\Reader::OPTION_FORGIVING);
-	} catch (Exception $e) {
-		self::$helper->warn("Update: Couldn't parse local group vcard: ".$group['vcard']);
-		return false;
+	if(!$this->config['use_categories']) {
+	    // create vcard from current DB data to be updated with the new data
+        try {
+            $vcf = VObject\Reader::read($group['vcard'], VObject\Reader::OPTION_FORGIVING);
+        } catch (Exception $e) {
+            self::$helper->warn("Update: Couldn't parse local group vcard: ".$group['vcard']);
+            return false;
+        }
+
+        $vcf->FN = $newname;
+        $vcf->N = $newname;
+        $vcfstr = $vcf->serialize();
+
+        if(!($etag = $this->put_record_to_carddav($group['uri'], $vcfstr, $group['etag'])))
+            return false;
+	} else {
+		$etag = $group['etag'];
+		$vcfstr = "";
 	}
-
-	$vcf->FN = $newname;
-	$vcf->N = $newname;
-	$vcfstr = $vcf->serialize();
-
-	if(!($etag = $this->put_record_to_carddav($group['uri'], $vcfstr, $group['etag'])))
-		return false;
-
 	if(!$this->dbstore_group($etag,$group['uri'],$vcfstr,$group,$group_id))
 		return false;
 
+	if($this->config['use_categories']) {
+		$contacts = self::get_dbrecord($group_id, 'contact_id as id', 'group_user', false, 'group_id');
+		$ids = array();
+		foreach($contacts as $contact) {
+			$ids[]=$contact['id'];
+		}
+		$this->update_contacts($ids);
+	}
+	
 	return $newname;
 	}}}
 
@@ -2022,7 +2129,7 @@ EOF
 	}
 
 	$abookrow = self::get_dbrecord($abookid,
-		'id as abookid,name,username,password,url,presetname,sync_token,authentication_scheme,'
+		'id as abookid,name,username,use_categories,password,url,presetname,sync_token,authentication_scheme,'
 		. $timequery . ' as needs_update', 'addressbooks');
 
 	if(! $abookrow) {
