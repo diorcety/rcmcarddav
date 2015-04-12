@@ -19,9 +19,6 @@
     51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 */
 
-// requires Roundcubemail 0.7.2 or later
-
-require_once('inc/sabre-vobject/lib/Sabre/VObject/includes.php');
 require_once("carddav_common.php");
 
 use \Sabre\VObject;
@@ -785,6 +782,18 @@ EOF
 					}
 				}
 			}
+      if (trim($save_data['name']) == '') { // roundcube display fix for contacts that don't have first/last names
+        if ($save_data['nickname'] !== NULL && trim($save_data['nickname'] !== '')) {
+          $save_data['name'] = $save_data['nickname'];
+        } else {
+          foreach ($save_data as $key=>$val) {
+            if (strpos($key,'email') !== false) {
+              $save_data['name'] = $val[0];
+              break;
+            }
+          }
+        }
+      }
 			if(!$this->dbstore_contact("$etag","$href","$vcf",$save_data,$dbid))
 				return -1;
 		}
@@ -1178,7 +1187,7 @@ EOF
 		'method'=>"PUT",
 		'content'=>$vcf,
 		'header'=> array(
-			"Content-Type: text/vcard;charset=utf-8",
+			"Content-Type: text/vcard; charset=\"utf-8\"",
 			$matchhdr,
 		),
 	);
@@ -2174,7 +2183,7 @@ EOF
 	}
 
 	$abookrow = self::get_dbrecord($abookid,
-		'id as abookid,name,username,use_categories,password,url,presetname,sync_token,preemptive_auth,'
+		'id as abookid,name,username,use_categories,password,url,presetname,sync_token,authentication_scheme,'
 		. $timequery . ' as needs_update', 'addressbooks');
 
 	if(! $abookrow) {
@@ -2190,6 +2199,25 @@ EOF
 	return $abookrow;
 	}}}
 
+	public static function update_addressbook($dbid=0, $xcol=array(), $xval=array())
+	{{{
+	$dbh = rcmail::get_instance()->db;
+
+	self::$helper->debug("UPDATE addressbook $dbid");
+	$xval[]=$dbid;
+	$sql_result = $dbh->query('UPDATE ' .
+		get_table_name("carddav_addressbooks") .
+		' SET ' . implode('=?,', $xcol) . '=?' .
+		' WHERE id=?', $xval);
+
+	if($dbh->is_error()) {
+		self::$helper->warn($dbh->is_error());
+		$this->set_error(self::ERROR_SAVING, $dbh->is_error());
+		return false;
+	}
+
+	return $dbid;
+	}}}
 	/**
 	 * Migrates settings to a separate addressbook table.
 	 */
