@@ -408,12 +408,6 @@ class carddav_backend extends rcube_addressbook
 	$dbh = rcmail::get_instance()->db;
 	$duration = time();
 
-	// determine existing local contact URIs and ETAGs
-	$contacts = self::get_dbrecord($this->id,'id,uri,etag','contacts',false,'abook_id');
-	foreach($contacts as $contact) {
-		$this->existing_card_cache[$contact['uri']] = $contact;
-	}
-
 	if(!$this->config['use_categories']) {
 		// determine existing local group URIs and ETAGs
 		$groups = self::get_dbrecord($this->id,'id,uri,etag','groups',false,'abook_id');
